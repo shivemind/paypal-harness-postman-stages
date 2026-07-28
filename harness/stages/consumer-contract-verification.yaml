@@ -1,0 +1,199 @@
+# PAYPAL DROP-IN — consumer-driven (Pact-shaped) contract verification.
+# Direction of truth is inverted versus the provider-side stages: each
+# consumer team commits a Pact contract (specification 2.x, 3.x, or 4.x
+# Synchronous/HTTP JSON) stating only the requests it makes and the response
+# fields it relies on. This stage
+# converts every contract into a generated Postman collection
+# (scripts/pact-to-collection.mjs), replays them against the live provider
+# with the pre-provisioned Postman CLI, publishes one JUnit report per
+# consumer, and records results in a deterministic verification ledger with a
+# can-i-deploy gate (scripts/can-i-deploy.mjs). Pure Run steps:
+# Kubernetes-portable without the privileged Drone plugin.
+#
+# Provider states ("given order 42 exists"): when the provider exposes a
+# state-change endpoint (the pact-provider-verifier stateChangeUrl
+# convention), set state_change_url and the generated collections POST
+# {action, state, params} to it before each interaction replays. Without it,
+# states are documented on each generated request and reported as warnings —
+# seed test data before the run. There is no broker; the contracts directory
+# in Git is the registry, and a Harness trigger on that repository replaces
+# broker webhooks.
+#
+# Assumptions pending PayPal confirmation (documented defaults, overridable):
+#   - Contracts live in-repo at contracts_dir as <consumer>.pact.json files.
+#   - provider_version is the provider commit SHA under test.
+#   - Mismatch policy: block (fail the stage); warn mode reports and passes.
+stage:
+  name: Postman - Consumer contract verification
+  identifier: postman_consumer_contract_verification
+  type: CI
+  variables:
+    - name: app_base_url
+      type: String
+      required: true
+      value: <+input>
+    - name: health_path
+      type: String
+      required: true
+      value: <+input>.default(/actuator/health)
+    - name: contracts_dir
+      type: String
+      required: true
+      value: <+input>.default(contracts/consumers)
+    - name: provider_name
+      type: String
+      required: true
+      value: <+input>
+    - name: provider_version
+      type: String
+      required: true
+      value: <+input>
+    - name: state_change_url
+      type: String
+      required: false
+      value: <+input>
+    - name: ledger_path
+      type: String
+      required: false
+      value: <+input>
+    - name: policy
+      type: String
+      required: true
+      value: <+input>.default(block).allowedValues(block,warn)
+  spec:
+    cloneCodebase: true
+    platform:
+      os: Linux
+      arch: Amd64
+    runtime:
+      type: Cloud
+      spec: {}
+    execution:
+      steps:
+        - step:
+            type: Run
+            name: Wait for application health
+            identifier: wait_for_application_health
+            spec:
+              shell: Sh
+              command: |-
+                set -eu
+                APP='<+stage.variables.app_base_url>'
+                HEALTH='<+stage.variables.health_path>'
+                for i in $(seq 1 60); do
+                  CODE=$(curl -s -o /dev/null -w '%{http_code}' "$APP$HEALTH" || true)
+                  [ "$CODE" = "200" ] && break
+                  sleep 5
+                done
+                [ "$CODE" = "200" ] || { echo 'Application health endpoint never returned 200.' >&2; exit 2; }
+                echo "application healthy: $APP"
+
+        - step:
+            type: Run
+            name: Convert consumer contracts to collections
+            identifier: convert_consumer_contracts
+            spec:
+              shell: Sh
+              command: |-
+                set -eu
+                CONTRACTS='<+stage.variables.contracts_dir>'
+                [ -d "$CONTRACTS" ] || { echo "::error::Contracts directory not found: $CONTRACTS"; exit 2; }
+                SCRIPT=/opt/postman-cs/pact-to-collection.mjs
+                [ -f "$SCRIPT" ] || SCRIPT=scripts/pact-to-collection.mjs
+                STATE_URL='<+stage.variables.state_change_url>'
+                case "$STATE_URL" in '<+'*) STATE_URL='' ;; esac
+                mkdir -p .consumer-contract-reports/collections
+                COUNT=0
+                for PACT in "$CONTRACTS"/*.json; do
+                  [ -f "$PACT" ] || continue
+                  NAME=$(basename "$PACT" .json)
+                  set -- --pact "$PACT" \
+                    --out ".consumer-contract-reports/collections/$NAME.postman_collection.json"
+                  [ -z "$STATE_URL" ] || set -- "$@" --state-change-url "$STATE_URL"
+                  node "$SCRIPT" "$@"
+                  sha256sum "$PACT" | cut -d' ' -f1 > ".consumer-contract-reports/collections/$NAME.sha256"
+                  COUNT=$((COUNT + 1))
+                done
+                [ "$COUNT" -gt 0 ] || { echo "::error::No consumer contract JSON files found in $CONTRACTS."; exit 2; }
+                echo "converted $COUNT consumer contract(s)"
+
+        - step:
+            type: Run
+            name: Replay consumer contracts against the provider
+            identifier: replay_consumer_contracts
+            spec:
+              shell: Sh
+              command: |-
+                set +x
+                set -eu
+                command -v postman >/dev/null || {
+                  echo 'The runner image must pre-provision the signed Postman CLI.' >&2
+                  exit 2
+                }
+                postman --version
+                POSTMAN_API_KEY='<+secrets.getValue("paypal_postman_service_account_pmak")>'
+                APP='<+stage.variables.app_base_url>'
+                PROVIDER='<+stage.variables.provider_name>'
+                PROVIDER_VERSION='<+stage.variables.provider_version>'
+                [ -n "$POSTMAN_API_KEY" ]
+                GATE=/opt/postman-cs/can-i-deploy.mjs
+                [ -f "$GATE" ] || GATE=scripts/can-i-deploy.mjs
+                LEDGER='<+stage.variables.ledger_path>'
+                case "$LEDGER" in ''|'<+'*) LEDGER=.consumer-contract-reports/verification-ledger.json ;; esac
+                trap 'postman logout >/dev/null 2>&1 || true' EXIT
+                postman login --with-api-key "$POSTMAN_API_KEY" >/dev/null
+                FAILED=0
+                for COLLECTION in .consumer-contract-reports/collections/*.postman_collection.json; do
+                  NAME=$(basename "$COLLECTION" .postman_collection.json)
+                  CONTRACT_SHA=$(cat ".consumer-contract-reports/collections/$NAME.sha256")
+                  RESULT=passed
+                  postman collection run "$COLLECTION" \
+                    --env-var "baseUrl=$APP" \
+                    --reporters cli,junit \
+                    --reporter-junit-export ".consumer-contract-reports/$NAME.xml" || { RESULT=failed; FAILED=1; }
+                  node "$GATE" record --ledger "$LEDGER" \
+                    --provider "$PROVIDER" --provider-version "$PROVIDER_VERSION" \
+                    --consumer "$NAME" --contract-sha "$CONTRACT_SHA" --result "$RESULT"
+                done
+                echo "POSTMAN_HARNESS event=consumer_replay_complete failedAny=$FAILED"
+              reports:
+                type: JUnit
+                spec:
+                  paths:
+                    - .consumer-contract-reports/*.xml
+
+        - step:
+            type: Run
+            name: Can-i-deploy gate
+            identifier: can_i_deploy_gate
+            spec:
+              shell: Sh
+              command: |-
+                set -eu
+                GATE=/opt/postman-cs/can-i-deploy.mjs
+                [ -f "$GATE" ] || GATE=scripts/can-i-deploy.mjs
+                LEDGER='<+stage.variables.ledger_path>'
+                case "$LEDGER" in ''|'<+'*) LEDGER=.consumer-contract-reports/verification-ledger.json ;; esac
+                POLICY='<+stage.variables.policy>'
+                if node "$GATE" check --ledger "$LEDGER" \
+                  --provider '<+stage.variables.provider_name>' \
+                  --provider-version '<+stage.variables.provider_version>' \
+                  --json-out .consumer-contract-reports/can-i-deploy.json; then
+                  echo 'can-i-deploy: all consumer contracts verified.'
+                else
+                  [ "$POLICY" = "warn" ] || { echo '::error::One or more consumer contracts failed verification.'; exit 1; }
+                  echo 'policy=warn: consumer contract failures reported without blocking.'
+                fi
+
+        - step:
+            type: Run
+            name: Summarize consumer-contract artifacts
+            identifier: summarize_consumer_contract_artifacts
+            when:
+              stageStatus: All
+            spec:
+              shell: Sh
+              command: |-
+                set -eu
+                find .consumer-contract-reports -type f -print 2>/dev/null | sort || true
+                echo 'POSTMAN_HARNESS event=stage_complete stage=consumer-contract-verification writePolicy=none'
