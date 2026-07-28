@@ -11,6 +11,7 @@ approval policy.
 | Make Postman tests a Harness quality gate | `postman-cli-quality-gate.yaml` | `postman-resolve-service-token-action` + Postman CLI | Exact service-account and workspace identity checks, spec lint, collection run, JUnit; read-only |
 | Bring governed Postman assets back to the repo | `postman-to-git-sync.yaml` | `postman-repo-sync-action` | Local commit only; never pushes |
 | Discover implemented runtime routes for later rogue-endpoint comparison | `runtime-route-discovery.yaml` | `postman-insights-onboarding-action` | Backend-blocked before writes until Insights accepts service-account identity end to end |
+| Verify consumer expectations Pact-style before promotion | `consumer-contract-verification.yaml` | Postman CLI + `pact-to-collection.mjs` / `can-i-deploy.mjs` (this repository) | Replays each consumer's committed Pact contract against the live provider; per-consumer JUnit; deterministic verification ledger + can-i-deploy gate; read-only |
 
 ## First pipeline for PayPal's technical team
 
@@ -96,3 +97,24 @@ policy remain open PayPal decisions — current values are documented
 assumptions.
 See `docs/CUSTOMER-TECHNICAL-CONSIDERATIONS.md` for the customer readiness
 checklist and the exact Insights boundary.
+
+## Consumer-driven (Pact-shaped) verification
+
+`consumer-contract-verification.yaml` inverts the direction of truth of the
+provider-side stages: consumer teams commit Pact contracts (specification
+2.x/3.x JSON) declaring only the requests they make and the response fields
+they rely on. The stage converts each contract into a generated Postman
+collection (`scripts/pact-to-collection.mjs`, deterministic — same pact bytes,
+same collection bytes), replays them against the live provider with the
+pre-provisioned Postman CLI, publishes one JUnit report per consumer so a
+breaking change names the consumer it breaks, and records results in a
+deterministic verification ledger with a can-i-deploy gate
+(`scripts/can-i-deploy.mjs`).
+
+Stated gaps versus Pact, not overclaimed: provider states are documented on
+each generated request and warned about, never automated — test data must be
+seeded before the run; there is no broker — the contracts directory in Git is
+the registry, and a Harness trigger on that repository stands in for broker
+webhooks; matcher support covers `type` (with `min` on arrays, cascading to
+leaves) and `regex`, with exact equality otherwise; Pact specification 4.x
+contracts are rejected explicitly rather than half-converted.
