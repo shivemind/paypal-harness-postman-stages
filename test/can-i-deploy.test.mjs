@@ -1,6 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { emptyLedger, recordResult, checkDeploy } from '../scripts/can-i-deploy.mjs';
+import {
+  emptyLedger,
+  recordResult,
+  checkDeploy,
+  recordDeployment,
+  deployedVersion,
+} from '../scripts/can-i-deploy.mjs';
 
 const entry = (overrides = {}) => ({
   providerVersion: 'abc123',
@@ -56,4 +62,27 @@ test('explicit consumer list narrows the gate; empty ledger never passes', () =>
 test('rejects malformed entries and unknown statuses', () => {
   assert.throws(() => recordResult(emptyLedger('p'), entry({ consumer: '' })), /required field "consumer"/);
   assert.throws(() => recordResult(emptyLedger('p'), entry({ status: 'flaky' })), /must be one of/);
+});
+
+test('deployments upsert per environment and resolve for environment checks', () => {
+  let ledger = emptyLedger('orders-service');
+  ledger = recordDeployment(ledger, { environment: 'staging', providerVersion: 'abc123' });
+  ledger = recordDeployment(ledger, { environment: 'prod', providerVersion: 'aaa000' });
+  ledger = recordDeployment(ledger, { environment: 'staging', providerVersion: 'def456' }); // replaces
+  assert.deepEqual(ledger.deployments, [
+    { environment: 'prod', providerVersion: 'aaa000' },
+    { environment: 'staging', providerVersion: 'def456' },
+  ]);
+  assert.equal(deployedVersion(ledger, 'staging'), 'def456');
+  assert.throws(() => deployedVersion(ledger, 'qa'), /No deployment recorded/);
+  assert.throws(() => recordDeployment(ledger, { environment: '', providerVersion: 'x' }), /required field "environment"/);
+});
+
+test('environment resolution composes with the verification gate', () => {
+  let ledger = emptyLedger('orders-service');
+  ledger = recordDeployment(ledger, { environment: 'staging', providerVersion: 'abc123' });
+  ledger = recordResult(ledger, entry()); // checkout-web passed @ abc123
+  assert.equal(checkDeploy(ledger, deployedVersion(ledger, 'staging')).ok, true);
+  ledger = recordDeployment(ledger, { environment: 'staging', providerVersion: 'def456' });
+  assert.equal(checkDeploy(ledger, deployedVersion(ledger, 'staging')).ok, false); // new version unverified
 });

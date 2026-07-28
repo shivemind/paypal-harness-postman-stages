@@ -118,10 +118,96 @@ test('conversion is deterministic and surfaces provider states as warnings', () 
   assert.match(first.warnings[0], /order 42 exists/);
 });
 
-test('rejects pact specification 4.x and empty contracts explicitly', () => {
+test('rejects v4 message interactions and empty contracts explicitly', () => {
   assert.throws(
-    () => convertPact({ metadata: { pactSpecification: { version: '4.0' } }, interactions: [{}] }),
-    /4\.x is not supported/,
+    () => convertPact({
+      metadata: { pactSpecification: { version: '4.0' } },
+      interactions: [{ type: 'Asynchronous/Messages', description: 'event' }],
+    }),
+    /only Synchronous\/HTTP/,
   );
   assert.throws(() => convertPact({ ...v3Pact, interactions: [] }), /no interactions/);
+});
+
+test('converts v4 Synchronous/HTTP interactions with wrapped bodies and array headers', () => {
+  const v4Pact = {
+    consumer: { name: 'checkout-web' },
+    provider: { name: 'orders-service' },
+    metadata: { pactSpecification: { version: '4.0' } },
+    interactions: [{
+      type: 'Synchronous/HTTP',
+      description: 'get an order (v4)',
+      providerStates: [{ name: 'order 7 exists', params: { id: 7 } }],
+      request: {
+        method: 'GET',
+        path: '/api/orders/7',
+        headers: { Accept: ['application/json'] },
+      },
+      response: {
+        status: 200,
+        headers: { 'Content-Type': ['application/json'] },
+        body: { content: { id: 7, status: 'CREATED' }, contentType: 'application/json' },
+        matchingRules: { body: { '$.id': { matchers: [{ match: 'integer' }] } } },
+      },
+    }],
+  };
+  const { collection, warnings } = convertPact(v4Pact);
+  const item = collection.item[0];
+  assert.equal(item.request.header[0].value, 'application/json'); // array header unwrapped
+  const script = item.event[0].script.exec.join('\n');
+  assert.match(script, /Number\.isInteger\(_\.get\(body, "id"\)\)/); // wrapped body unwrapped
+  assert.match(script, /body \$\.status equals expected/);
+  assert.equal(warnings.length, 1); // provider state warned without state-change URL
+});
+
+test('extended matchers generate the right assertion shapes', () => {
+  const script = buildTestScript({
+    status: 200,
+    body: {
+      count: 3, price: 1.5, active: true, gone: null,
+      note: 'contains-me', created: '2026-07-28T00:00:00Z', odd: 'x',
+    },
+    matchingRules: {
+      body: {
+        '$.count': { matchers: [{ match: 'integer' }] },
+        '$.price': { matchers: [{ match: 'decimal' }] },
+        '$.active': { matchers: [{ match: 'boolean' }] },
+        '$.gone': { matchers: [{ match: 'null' }] },
+        '$.note': { matchers: [{ match: 'include', value: 'contains' }] },
+        '$.created': { matchers: [{ match: 'datetime' }] },
+        '$.odd': { matchers: [{ match: 'somethingUnknown' }] },
+      },
+    },
+  }).join('\n');
+  assert.match(script, /Number\.isInteger\(_\.get\(body, "count"\)\)/);
+  assert.match(script, /typeof _\.get\(body, "price"\)\)\.to\.eql\("number"\)/);
+  assert.match(script, /typeof _\.get\(body, "active"\)\)\.to\.eql\("boolean"\)/);
+  assert.match(script, /_\.get\(body, "gone"\)\)\.to\.eql\(null\)/);
+  assert.match(script, /String\(_\.get\(body, "note"\)\)\.includes\("contains"\)/);
+  assert.match(script, /non-empty datetime string/);
+  assert.match(script, /body \$\.odd equals expected/); // unknown matcher -> equality
+});
+
+test('array max bound is enforced alongside min', () => {
+  const script = buildTestScript({
+    status: 200,
+    body: { items: [1, 2] },
+    matchingRules: { body: { '$.items': { matchers: [{ match: 'type', min: 1, max: 5 }] } } },
+  }).join('\n');
+  assert.match(script, /to\.be\.at\.least\(1\)/);
+  assert.match(script, /to\.be\.at\.most\(5\)/);
+});
+
+test('state-change URL emits setup requests before the interaction, in order', () => {
+  const { collection, warnings } = convertPact(v3Pact, { stateChangeUrl: 'http://localhost:9999/pact-states' });
+  assert.equal(warnings.length, 0); // automated, so no manual-seed warning
+  assert.deepEqual(
+    collection.item.map((i) => i.name),
+    ['[setup] order 42 exists', 'get an order by id', 'create an order'],
+  );
+  const setup = collection.item[0];
+  assert.equal(setup.request.method, 'POST');
+  assert.equal(setup.request.url, 'http://localhost:9999/pact-states');
+  assert.deepEqual(JSON.parse(setup.request.body.raw), { action: 'setup', state: 'order 42 exists', params: {} });
+  assert.match(setup.event[0].script.exec.join('\n'), /to\.be\.below\(300\)/);
 });

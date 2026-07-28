@@ -11,9 +11,16 @@
 //     --consumer <name> --contract-sha <sha256-of-pact-file> \
 //     --result passed|failed
 //
-// Gate a deploy of one provider version:
+// Record which provider version is deployed to an environment (idempotent
+// upsert per environment — the Pact-broker record-deployment analogue):
+//   node scripts/can-i-deploy.mjs record-deployment --ledger <ledger.json> \
+//     --environment <name> --provider-version <sha>
+//
+// Gate a deploy of one provider version (or of whatever version an
+// environment currently runs, via --environment):
 //   node scripts/can-i-deploy.mjs check --ledger <ledger.json> \
-//     --provider-version <sha> [--consumers a,b] [--json-out <report.json>]
+//     --provider-version <sha> | --environment <name> \
+//     [--consumers a,b] [--json-out <report.json>]
 //
 // Check semantics: every required consumer (the --consumers list, or every
 // consumer present in the ledger) must have at least one recorded verification
@@ -31,7 +38,7 @@ function arg(name, fallback) {
 }
 
 export function emptyLedger(provider) {
-  return { schemaVersion: SCHEMA_VERSION, provider: String(provider), results: [] };
+  return { schemaVersion: SCHEMA_VERSION, provider: String(provider), results: [], deployments: [] };
 }
 
 export function loadLedger(path, provider) {
@@ -40,7 +47,28 @@ export function loadLedger(path, provider) {
   if (ledger.schemaVersion !== SCHEMA_VERSION) {
     throw new Error(`Unsupported ledger schemaVersion ${ledger.schemaVersion}; expected ${SCHEMA_VERSION}.`);
   }
+  if (!Array.isArray(ledger.deployments)) ledger.deployments = [];
   return ledger;
+}
+
+export function recordDeployment(ledger, { environment, providerVersion }) {
+  for (const [field, value] of [['environment', environment], ['providerVersion', providerVersion]]) {
+    if (!value || typeof value !== 'string') {
+      throw new Error(`Deployment record is missing required field "${field}".`);
+    }
+  }
+  const next = ledger.deployments.filter((d) => d.environment !== environment);
+  next.push({ environment, providerVersion });
+  next.sort((a, b) => a.environment.localeCompare(b.environment));
+  return { ...ledger, deployments: next };
+}
+
+export function deployedVersion(ledger, environment) {
+  const found = ledger.deployments.find((d) => d.environment === environment);
+  if (!found) {
+    throw new Error(`No deployment recorded for environment "${environment}".`);
+  }
+  return found.providerVersion;
 }
 
 export function recordResult(ledger, entry) {
@@ -87,9 +115,20 @@ export function checkDeploy(ledger, providerVersion, requiredConsumers = null) {
 function main() {
   const mode = process.argv[2];
   const ledgerPath = arg('ledger');
-  if (!ledgerPath || (mode !== 'record' && mode !== 'check')) {
-    console.error('Usage: can-i-deploy.mjs record|check --ledger <ledger.json> ...');
+  if (!ledgerPath || !['record', 'record-deployment', 'check'].includes(mode)) {
+    console.error('Usage: can-i-deploy.mjs record|record-deployment|check --ledger <ledger.json> ...');
     process.exit(2);
+  }
+
+  if (mode === 'record-deployment') {
+    const ledger = loadLedger(ledgerPath, arg('provider', 'unknown-provider'));
+    const updated = recordDeployment(ledger, {
+      environment: arg('environment', ''),
+      providerVersion: arg('provider-version', ''),
+    });
+    writeFileSync(ledgerPath, `${JSON.stringify(updated, null, 2)}\n`);
+    console.log(`recorded deployment ${arg('environment')} -> ${arg('provider-version')}`);
+    return;
   }
 
   if (mode === 'record') {
@@ -109,7 +148,9 @@ function main() {
   const ledger = loadLedger(ledgerPath, arg('provider', 'unknown-provider'));
   const consumersArg = arg('consumers', '');
   const required = consumersArg ? consumersArg.split(',').map((s) => s.trim()).filter(Boolean) : null;
-  const verdict = checkDeploy(ledger, arg('provider-version', ''), required);
+  const environment = arg('environment', '');
+  const providerVersion = environment ? deployedVersion(ledger, environment) : arg('provider-version', '');
+  const verdict = checkDeploy(ledger, providerVersion, required);
   if (arg('json-out')) writeFileSync(arg('json-out'), `${JSON.stringify(verdict, null, 2)}\n`);
   for (const consumer of verdict.perConsumer) {
     console.log(`  ${consumer.status.toUpperCase().padEnd(10)} ${consumer.consumer}`);

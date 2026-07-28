@@ -1,7 +1,8 @@
 # PAYPAL DROP-IN — consumer-driven (Pact-shaped) contract verification.
 # Direction of truth is inverted versus the provider-side stages: each
-# consumer team commits a Pact contract (specification 2.x/3.x JSON) stating
-# only the requests it makes and the response fields it relies on. This stage
+# consumer team commits a Pact contract (specification 2.x, 3.x, or 4.x
+# Synchronous/HTTP JSON) stating only the requests it makes and the response
+# fields it relies on. This stage
 # converts every contract into a generated Postman collection
 # (scripts/pact-to-collection.mjs), replays them against the live provider
 # with the pre-provisioned Postman CLI, publishes one JUnit report per
@@ -9,11 +10,14 @@
 # can-i-deploy gate (scripts/can-i-deploy.mjs). Pure Run steps:
 # Kubernetes-portable without the privileged Drone plugin.
 #
-# Known gap versus Pact, stated up front (not overclaimed): provider states
-# ("given order 42 exists") are documented on each generated request and
-# reported as warnings, but state setup is NOT automated — seed test data
-# before the run. There is no broker; the contracts directory in Git is the
-# registry, and a Harness trigger on that repository replaces broker webhooks.
+# Provider states ("given order 42 exists"): when the provider exposes a
+# state-change endpoint (the pact-provider-verifier stateChangeUrl
+# convention), set state_change_url and the generated collections POST
+# {action, state, params} to it before each interaction replays. Without it,
+# states are documented on each generated request and reported as warnings —
+# seed test data before the run. There is no broker; the contracts directory
+# in Git is the registry, and a Harness trigger on that repository replaces
+# broker webhooks.
 #
 # Assumptions pending PayPal confirmation (documented defaults, overridable):
 #   - Contracts live in-repo at contracts_dir as <consumer>.pact.json files.
@@ -43,6 +47,10 @@ stage:
     - name: provider_version
       type: String
       required: true
+      value: <+input>
+    - name: state_change_url
+      type: String
+      required: false
       value: <+input>
     - name: ledger_path
       type: String
@@ -92,13 +100,17 @@ stage:
                 [ -d "$CONTRACTS" ] || { echo "::error::Contracts directory not found: $CONTRACTS"; exit 2; }
                 SCRIPT=/opt/postman-cs/pact-to-collection.mjs
                 [ -f "$SCRIPT" ] || SCRIPT=scripts/pact-to-collection.mjs
+                STATE_URL='<+stage.variables.state_change_url>'
+                case "$STATE_URL" in '<+'*) STATE_URL='' ;; esac
                 mkdir -p .consumer-contract-reports/collections
                 COUNT=0
                 for PACT in "$CONTRACTS"/*.json; do
                   [ -f "$PACT" ] || continue
                   NAME=$(basename "$PACT" .json)
-                  node "$SCRIPT" --pact "$PACT" \
+                  set -- --pact "$PACT" \
                     --out ".consumer-contract-reports/collections/$NAME.postman_collection.json"
+                  [ -z "$STATE_URL" ] || set -- "$@" --state-change-url "$STATE_URL"
+                  node "$SCRIPT" "$@"
                   sha256sum "$PACT" | cut -d' ' -f1 > ".consumer-contract-reports/collections/$NAME.sha256"
                   COUNT=$((COUNT + 1))
                 done
